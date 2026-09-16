@@ -35,6 +35,7 @@ import {
   utf8ByteLength,
 } from "../../internal/shared.worker.ts";
 import type {
+  R2BucketLockRule,
   R2Conditional,
   R2Etag,
   R2ServiceProps,
@@ -45,6 +46,8 @@ import {
   BINDING_R2_OBJECT,
   HEADER_R2_BUCKET,
   HEADER_R2_CONTROL_OP,
+  HEADER_R2_LOCK_RULES,
+  isR2ObjectLocked,
   testR2Conditional,
 } from "./R2BucketOptions.shared.ts";
 
@@ -56,10 +59,11 @@ interface Env {
 
 export default {
   async fetch(request, env, ctx) {
-    const { bucketName } = (ctx as { props: R2ServiceProps }).props;
+    const { bucketName, lockRules } = (ctx as { props: R2ServiceProps }).props;
     const stub = env[BINDING_R2_OBJECT].getByName(bucketName);
     const headers = new Headers(request.headers);
     headers.set(HEADER_R2_BUCKET, encodeURIComponent(bucketName));
+    headers.set(HEADER_R2_LOCK_RULES, JSON.stringify(lockRules ?? []));
     return stub.fetch(new Request(request, { headers }));
   },
 } satisfies ExportedHandler<Env>;
@@ -1869,12 +1873,25 @@ export class R2BucketObject implements DurableObject {
     return new InternalR2ObjectBody(row, value, r2Range);
   }
 
+  #assertUnlocked(key: string, rules: readonly R2BucketLockRule[]) {
+    const row = this.#stmts.getByKey(key);
+    if (row && isR2ObjectLocked(rules, key, row.uploaded, Date.now())) {
+      throw new R2Error(
+        403,
+        "Object is locked by an R2 bucket retention rule",
+        0,
+      );
+    }
+  }
+
   async #put(
     key: string,
     value: ReadableStream<Uint8Array>,
     valueSize: number,
     opts: InternalR2PutOptions,
+    lockRules: readonly R2BucketLockRule[],
   ): Promise<InternalR2Object> {
+    this.#assertUnlocked(key, lockRules);
     // Store value in the blob store, computing required digests as we go
     // (this means we don't have to buffer the entire stream to compute them)
     const algorithms: Array<DigestAlgorithm> = [];
@@ -1907,6 +1924,7 @@ export class R2BucketObject implements DurableObject {
     };
     let oldBlobIds: Array<string> | undefined;
     try {
+      this.#assertUnlocked(key, lockRules);
       oldBlobIds = this.#stmts.put(row, opts.onlyIf);
     } catch (e) {
       // Probably precondition failed. In any case, the put transaction failed,
@@ -1920,9 +1938,13 @@ export class R2BucketObject implements DurableObject {
     return new InternalR2Object(row);
   }
 
-  #delete(keys: string | Array<string>) {
+  #delete(
+    keys: string | Array<string>,
+    lockRules: readonly R2BucketLockRule[],
+  ) {
     if (!Array.isArray(keys)) keys = [keys];
     for (const key of keys) validate.key(key);
+    for (const key of keys) this.#assertUnlocked(key, lockRules);
     const oldBlobIds = this.#stmts.deleteByKeys(keys);
     for (const blobId of oldBlobIds) this.#backgroundDelete(blobId);
   }
@@ -2094,7 +2116,9 @@ export class R2BucketObject implements DurableObject {
     key: string,
     uploadId: string,
     parts: Array<R2PublishedPart>,
+    lockRules: readonly R2BucketLockRule[],
   ): Promise<InternalR2Object> {
+    this.#assertUnlocked(key, lockRules);
     validate.key(key);
     const minPartSize = this.beingTested
       ? R2Limits.MIN_MULTIPART_PART_SIZE_TEST
@@ -2134,9 +2158,15 @@ export class R2BucketObject implements DurableObject {
 
   async #handlePut(req: Request): Promise<Response> {
     const { metadata, metadataSize, value } = await decodeMetadata(req);
+    const lockRules: R2BucketLockRule[] = JSON.parse(
+      req.headers.get(HEADER_R2_LOCK_RULES) ?? "[]",
+    );
 
     if (metadata.method === "delete") {
-      this.#delete("object" in metadata ? metadata.object : metadata.objects);
+      this.#delete(
+        "object" in metadata ? metadata.object : metadata.objects,
+        lockRules,
+      );
       return new Response();
     } else if (metadata.method === "put") {
       const contentLength = parseInt(
@@ -2152,6 +2182,7 @@ export class R2BucketObject implements DurableObject {
         value,
         valueSize,
         metadata,
+        lockRules,
       );
       return encodeResult(result);
     } else if (metadata.method === "createMultipartUpload") {
@@ -2180,6 +2211,7 @@ export class R2BucketObject implements DurableObject {
         metadata.object,
         metadata.uploadId,
         metadata.parts,
+        lockRules,
       );
       return encodeResult(result);
     } else if (metadata.method === "abortMultipartUpload") {

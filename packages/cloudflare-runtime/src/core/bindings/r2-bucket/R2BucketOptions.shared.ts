@@ -10,6 +10,8 @@ export interface R2BucketProps {
    * persisted on disk.
    */
   readonly id?: string;
+  /** Bucket retention rules applied to object overwrites and deletion. */
+  readonly lockRules?: readonly R2BucketLockRule[];
 }
 
 /**
@@ -19,6 +21,7 @@ export interface R2BucketProps {
  */
 export interface R2ServiceProps {
   readonly bucketName: string;
+  readonly lockRules?: readonly R2BucketLockRule[];
 }
 
 export const SERVICE_R2 = "r2";
@@ -41,6 +44,39 @@ export const HEADER_R2_BUCKET = "CF-Runtime-R2-Bucket";
  * control endpoints are enabled; used by tests.
  */
 export const HEADER_R2_CONTROL_OP = "CF-Runtime-R2-Control-Op";
+
+/** Retention policy applied to an existing object's upload timestamp. */
+export interface R2BucketLockRule {
+  readonly id: string;
+  readonly enabled?: boolean;
+  readonly prefix?: string;
+  readonly condition:
+    | { readonly type: "Age"; readonly maxAgeSeconds: number }
+    | { readonly type: "Date"; readonly date: string }
+    | { readonly type: "Indefinite" };
+}
+
+export const HEADER_R2_LOCK_RULES = "CF-Runtime-R2-Lock-Rules";
+
+export function isR2ObjectLocked(
+  rules: readonly R2BucketLockRule[] | undefined,
+  key: string,
+  uploaded: number,
+  now: number,
+): boolean {
+  return (rules ?? []).some((rule) => {
+    if (rule.enabled === false || !key.startsWith(rule.prefix ?? ""))
+      return false;
+    if (rule.condition.type === "Indefinite") return true;
+    const until =
+      rule.condition.type === "Date"
+        ? Date.parse(rule.condition.date)
+        : uploaded + rule.condition.maxAgeSeconds * 1000;
+    if (!Number.isFinite(until))
+      throw new Error("Invalid R2 bucket lock retention condition");
+    return now < until;
+  });
+}
 
 // -----------------------------------------------------------------------------
 // Conditional evaluation (`workers/r2/validator.worker.ts` upstream)

@@ -175,7 +175,11 @@ export const toRuntimeBinding = Effect.fn(function* (
       // (R2 has no opaque id — the name is the identity); a real name is a
       // live bucket the dev worker proxies to.
       return isLocalId(b.bucketName)
-        ? R2Bucket.local({ binding: b.name, id: b.bucketName })
+        ? R2Bucket.local({
+            binding: b.name,
+            id: b.bucketName,
+            lockRules: b.lockRules,
+          })
         : R2Bucket.remote(b.name, b.bucketName, b.jurisdiction);
     case "ratelimit":
       return RateLimit.local({

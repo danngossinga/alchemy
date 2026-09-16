@@ -1206,7 +1206,7 @@ const forceDeleteBucket = Effect.fn(function* (
 // no destructive request was ever issued. These run the REAL provider
 // `delete` against a recording transport and assert on the wire traffic.
 
-type Recorded = { method: string; url: string };
+type Recorded = { method: string; url: string; body?: string };
 
 /** Fetch transport that records every request and answers from `respond`. */
 const recordingTransport = (respond: (call: Recorded) => Response) => {
@@ -1218,6 +1218,12 @@ const recordingTransport = (respond: (call: Recorded) => Response) => {
     calls.push({
       method: (input instanceof Request ? input.method : init?.method) ?? "GET",
       url: input instanceof Request ? input.url : String(input),
+      body:
+        input instanceof Request
+          ? await input.clone().text()
+          : init?.body === undefined
+            ? undefined
+            : await new Response(init.body).text(),
     });
     return respond(calls[calls.length - 1]!);
   };
@@ -1372,6 +1378,190 @@ describe("destructive delete requires explicit opt-in", () => {
       const calls = yield* recordDelete({}, { force: true });
 
       expect(objectDeletes(calls).length).toBeGreaterThan(0);
+    }),
+  );
+});
+
+const lockRule: Cloudflare.R2.BucketLockRule = {
+  id: "audit",
+  prefix: "audit/",
+  condition: { type: "Indefinite" },
+};
+
+const success = (result: unknown) =>
+  new Response(JSON.stringify({ success: true, result }), {
+    headers: { "content-type": "application/json" },
+  });
+
+const missingBucket = () =>
+  new Response(
+    JSON.stringify({
+      success: false,
+      errors: [{ code: 10006, message: "bucket not found" }],
+    }),
+    { status: 404, headers: { "content-type": "application/json" } },
+  );
+
+const lockTransport = (options: {
+  rules: Cloudflare.R2.BucketLockRule[];
+  missingFirst?: boolean;
+}) => {
+  let missing = options.missingFirst ?? false;
+  return recordingTransport((call) => {
+    const path = new URL(call.url).pathname;
+    if (path.endsWith(`/r2/buckets/${stubbedOutput.bucketName}`)) {
+      if (call.method === "GET" && missing) {
+        missing = false;
+        return missingBucket();
+      }
+      return success({
+        name: stubbedOutput.bucketName,
+        storage_class: "Standard",
+        jurisdiction: "default",
+      });
+    }
+    if (path.endsWith("/lock")) return success({ rules: options.rules });
+    if (path.endsWith("/domains/custom")) return success({ domains: [] });
+    if (path.endsWith("/lifecycle")) return success({ rules: [] });
+    if (path.endsWith("/cors")) return success({ rules: [] });
+    if (path.endsWith("/domains/managed"))
+      return success({
+        bucket_id: "bucket-id",
+        domain: "example.r2.dev",
+        enabled: false,
+      });
+    return success({});
+  });
+};
+
+const lockOutput = (lockRules?: Cloudflare.R2.BucketLockRule[]) => ({
+  ...stubbedOutput,
+  lockRules,
+});
+
+const session = {
+  emit: () => Effect.void,
+  done: () => Effect.void,
+  note: () => Effect.void,
+};
+
+const recordLockRead = (
+  persistedRules: Cloudflare.R2.BucketLockRule[] | undefined,
+  observedRules: Cloudflare.R2.BucketLockRule[],
+) =>
+  Effect.gen(function* () {
+    const transport = lockTransport({ rules: observedRules });
+    const observed = yield* Effect.gen(function* () {
+      const provider = yield* Provider<Cloudflare.R2.Bucket>(
+        "Cloudflare.R2.Bucket",
+      );
+      return yield* provider.read!({
+        id: "Bucket",
+        fqn: "Bucket",
+        instanceId: INSTANCE_ID,
+        olds: { name: stubbedOutput.bucketName } as never,
+        output: lockOutput(persistedRules),
+      });
+    }).pipe(
+      Effect.provide(Cloudflare.R2.BucketProvider()),
+      Effect.provide(stubbedEnv(transport.layer)),
+    );
+    return { calls: transport.calls, observed };
+  });
+
+const recordLockReconcile = (options: {
+  news: Cloudflare.R2.BucketProps;
+  output: Cloudflare.R2.BucketLockRule[] | undefined;
+  observed: Cloudflare.R2.BucketLockRule[];
+  missingFirst?: boolean;
+}) =>
+  Effect.gen(function* () {
+    const transport = lockTransport({
+      rules: options.observed,
+      missingFirst: options.missingFirst,
+    });
+    yield* Effect.gen(function* () {
+      const provider = yield* Provider<Cloudflare.R2.Bucket>(
+        "Cloudflare.R2.Bucket",
+      );
+      yield* provider.reconcile({
+        id: "Bucket",
+        fqn: "Bucket",
+        instanceId: INSTANCE_ID,
+        news: options.news,
+        olds: options.news,
+        output:
+          options.output === undefined ? undefined : lockOutput(options.output),
+        bindings: [] as never,
+        session,
+      });
+    }).pipe(
+      Effect.provide(Cloudflare.R2.BucketProvider()),
+      Effect.provide(stubbedEnv(transport.layer)),
+    );
+    return transport.calls;
+  });
+
+const lockPuts = (calls: Recorded[]) =>
+  calls.filter((call) => call.method === "PUT" && call.url.endsWith("/lock"));
+
+describe("R2 bucket locks", () => {
+  it.effect(
+    "observes external drift and restores the desired lock document",
+    () =>
+      Effect.gen(function* () {
+        const read = yield* recordLockRead([lockRule], []);
+        expect(read.observed?.lockRules).toEqual([]);
+        expect(read.calls.some((call) => call.url.endsWith("/lock"))).toBe(
+          true,
+        );
+
+        const calls = yield* recordLockReconcile({
+          news: { lockRules: [lockRule] },
+          output: read.observed?.lockRules,
+          observed: [],
+        });
+        expect(lockPuts(calls)).toHaveLength(1);
+        expect(JSON.parse(lockPuts(calls)[0]!.body!)).toEqual({
+          rules: [{ ...lockRule, enabled: true }],
+        });
+      }),
+  );
+
+  it.effect("creates, preserves on omission, and clears only with []", () =>
+    Effect.gen(function* () {
+      const created = yield* recordLockReconcile({
+        news: { name: stubbedOutput.bucketName, lockRules: [lockRule] },
+        output: undefined,
+        observed: [],
+        missingFirst: true,
+      });
+      expect(
+        created.some(
+          (call) => call.method === "POST" && call.url.endsWith("/r2/buckets"),
+        ),
+      ).toBe(true);
+      expect(lockPuts(created)).toHaveLength(1);
+
+      const omittedRead = yield* recordLockRead(undefined, [lockRule]);
+      expect(omittedRead.calls.some((call) => call.url.endsWith("/lock"))).toBe(
+        false,
+      );
+
+      const preserved = yield* recordLockReconcile({
+        news: {},
+        output: [lockRule],
+        observed: [lockRule],
+      });
+      expect(lockPuts(preserved)).toEqual([]);
+
+      const cleared = yield* recordLockReconcile({
+        news: { lockRules: [] },
+        output: [lockRule],
+        observed: [lockRule],
+      });
+      expect(lockPuts(cleared)).toHaveLength(1);
+      expect(JSON.parse(lockPuts(cleared)[0]!.body!)).toEqual({ rules: [] });
     }),
   );
 });

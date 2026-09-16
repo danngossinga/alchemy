@@ -159,7 +159,10 @@ export const R2BucketLive = Layer.effect(
 export const local = (props: R2BucketProps): BindingHook<R2Bucket> =>
   Plugin.use(R2Bucket, (r2) =>
     Effect.map(
-      r2.api.register({ bucketName: props.id ?? props.binding }),
+      r2.api.register({
+        bucketName: props.id ?? props.binding,
+        lockRules: props.lockRules,
+      }),
       (service): WorkerdConfig.Worker_Binding => ({
         name: props.binding,
         r2Bucket: service,

@@ -21,7 +21,7 @@ import type { Namespace } from "../KV/Namespace.ts";
 import type { LegacyPipeline } from "../Pipelines/LegacyPipeline.ts";
 import type { Stream as PipelinesStream } from "../Pipelines/Stream.ts";
 import type { Queue } from "../Queues/Queue.ts";
-import type { Bucket } from "../R2/Bucket.ts";
+import type { Bucket, BucketLockRule } from "../R2/Bucket.ts";
 import type { Secret } from "../SecretsStore/Secret.ts";
 import type { StreamBinding } from "../Stream/StreamBinding.ts";
 import type { Index as VectorizeIndex } from "../Vectorize/VectorizeIndex.ts";
@@ -117,6 +117,18 @@ export type QueueWorkerBinding = Extract<
 };
 
 /**
+ * The `r2_bucket` metadata binding extended with local-only retention rules.
+ * The Worker provider strips this field before Cloudflare upload; the local
+ * runtime consumes it.
+ */
+export type R2BucketWorkerBinding = Extract<
+  DistilledWorkerBinding,
+  { type: "r2_bucket" }
+> & {
+  lockRules?: BucketLockRule[];
+};
+
+/**
  * The `service` metadata binding extended with workerd's `ctx.props`.
  * `props` is what a `Cloudflare.WorkerEntrypoint(worker, { props })` env
  * entry lowers to; the local runtime delivers it to the target entrypoint.
@@ -135,20 +147,24 @@ export type ServiceWorkerBinding = Extract<
  * The wire-shape binding union the Cloudflare API accepts — {@link WorkerBinding}
  * minus the alchemy-only members that must be lowered before upload.
  */
-export type WireWorkerBinding = Exclude<
-  WorkerBinding,
-  SelfUrlWorkerBinding | SelfServiceWorkerBinding
->;
+export type WireWorkerBinding =
+  | Exclude<
+      WorkerBinding,
+      SelfUrlWorkerBinding | SelfServiceWorkerBinding | R2BucketWorkerBinding
+    >
+  | Extract<DistilledWorkerBinding, { type: "r2_bucket" }>;
 
 export type WorkerBinding =
   | Exclude<
       DistilledWorkerBinding,
       | { type: "durable_object_namespace" }
       | { type: "queue" }
+      | { type: "r2_bucket" }
       | { type: "service" }
     >
   | DurableObjectNamespaceWorkerBinding
   | QueueWorkerBinding
+  | R2BucketWorkerBinding
   | ServiceWorkerBinding
   | SelfUrlWorkerBinding
   | SelfServiceWorkerBinding;

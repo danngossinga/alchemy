@@ -496,6 +496,7 @@ const toBinding = (
       type: "r2_bucket",
       name: bindingName,
       bucketName: binding.bucketName,
+      lockRules: binding.lockRules,
       jurisdiction: binding.jurisdiction.pipe(
         Output.map((jurisdiction) =>
           jurisdiction === "default" ? undefined : jurisdiction,

@@ -1376,30 +1376,46 @@ export const ProviderLive = () =>
           const name =
             output?.bucketName ?? (yield* createBucketName(id, olds?.name));
           const acct = output?.accountId ?? accountId;
-          return yield* r2
-            .getBucket({
+          const jurisdiction = output?.jurisdiction ?? olds?.jurisdiction;
+          return yield* Effect.gen(function* () {
+            const bucket = yield* r2.getBucket({
               accountId: acct,
               bucketName: name,
-              jurisdiction: output?.jurisdiction ?? olds?.jurisdiction,
-            })
-            .pipe(
-              Effect.map((bucket) => ({
-                bucketName: bucket.name!,
-                // Distilled widened generated string enums to open unions.
-                storageClass: (bucket.storageClass ??
-                  "Standard") as Bucket.StorageClass,
-                jurisdiction: (bucket.jurisdiction ??
-                  "default") as Bucket.Jurisdiction,
-                location: normalizeLocation(bucket.location),
-                accountId: acct,
-                domains: output?.domains ?? [],
-                lifecycleRules: output?.lifecycleRules ?? [],
-                cors: output?.cors ?? [],
-                lockRules: output?.lockRules,
-                publicDomain: output?.publicDomain,
-              })),
-              Effect.catchTag("NoSuchBucket", () => Effect.succeed(undefined)),
-            );
+              jurisdiction,
+            });
+            const lockRules =
+              output?.lockRules === undefined
+                ? undefined
+                : (
+                    (yield* r2.getBucketLock({
+                      accountId: acct,
+                      bucketName: name,
+                      jurisdiction,
+                    })).rules ?? []
+                  ).map((rule) =>
+                    normalizeLockRule({
+                      ...rule,
+                      prefix: rule.prefix ?? undefined,
+                    }),
+                  );
+            return {
+              bucketName: bucket.name!,
+              // Distilled widened generated string enums to open unions.
+              storageClass: (bucket.storageClass ??
+                "Standard") as Bucket.StorageClass,
+              jurisdiction: (bucket.jurisdiction ??
+                "default") as Bucket.Jurisdiction,
+              location: normalizeLocation(bucket.location),
+              accountId: acct,
+              domains: output?.domains ?? [],
+              lifecycleRules: output?.lifecycleRules ?? [],
+              cors: output?.cors ?? [],
+              lockRules,
+              publicDomain: output?.publicDomain,
+            };
+          }).pipe(
+            Effect.catchTag("NoSuchBucket", () => Effect.succeed(undefined)),
+          );
         }),
       };
     }),

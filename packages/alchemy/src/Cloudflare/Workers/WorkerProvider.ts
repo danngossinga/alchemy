@@ -2871,23 +2871,22 @@ export const LiveWorkerProvider = () =>
           ...preparedHash,
           metadata: metadataHash,
         } satisfies Worker["Attributes"]["hash"];
-        // Lower the `Worker.URL` sentinel into the aliased preview URL —
-        // same lowering `putWorker` performs, with the alias standing in
-        // for the script's own URL. `Worker.Self` lowers to a
-        // service binding on the parent script (versions have no name of
-        // their own).
+        // Lower Alchemy-only metadata before the version upload, just as the
+        // full Worker upload does.
         const metadataBindings = bindings.flatMap((b) =>
-          (b.data.bindings ?? []).map((item) =>
-            item.type === "self_url"
-              ? { type: "plain_text" as const, name: item.name, text: selfUrl! }
-              : item.type === "self_service"
-                ? {
-                    type: "service" as const,
-                    name: item.name,
-                    service: parentName,
-                  }
-                : item,
-          ),
+          (b.data.bindings ?? []).map((item): WireWorkerBinding => {
+            if (item.type === "self_url") {
+              return { type: "plain_text", name: item.name, text: selfUrl! };
+            }
+            if (item.type === "self_service") {
+              return { type: "service", name: item.name, service: parentName };
+            }
+            if (item.type === "r2_bucket") {
+              const { lockRules: _, ...rest } = item;
+              return rest;
+            }
+            return item;
+          }),
         );
         let metadataAssets:
           | workers.CreateScriptVersionRequest["metadata"]["assets"]
@@ -3154,10 +3153,7 @@ export const LiveWorkerProvider = () =>
           assets: prebuiltAssets?.hash ?? preparedHash.assets,
           metadata: metadataHash,
         } satisfies Worker["Attributes"]["hash"];
-        // `transferredFrom` is alchemy-only transfer metadata on
-        // durable_object_namespace bindings — it drives the
-        // `transferred_classes` migration below and must be stripped from the
-        // wire-shape binding before upload.
+        // Alchemy-only binding metadata must be stripped before upload.
         const metadataBindings = bindings.flatMap((b) =>
           (b.data.bindings ?? []).map((item): WireWorkerBinding => {
             // Lower the `Worker.URL` sentinel into the resolved URL —
@@ -3169,6 +3165,10 @@ export const LiveWorkerProvider = () =>
             // binding targeting this Worker's own physical name.
             if (item.type === "self_service") {
               return { type: "service", name: item.name, service: name };
+            }
+            if (item.type === "r2_bucket") {
+              const { lockRules: _, ...rest } = item;
+              return rest;
             }
             if (
               item.type === "durable_object_namespace" &&
