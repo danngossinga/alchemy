@@ -109,6 +109,44 @@ test.provider(
   { timeout: 120_000 },
 );
 
+test.provider(
+  "R2 bucket lock declarations are retained locally until explicitly cleared",
+  (stack) =>
+    Effect.gen(function* () {
+      yield* stack.destroy();
+      const deploy = (lockRules?: Cloudflare.R2.BucketLockRule[]) =>
+        stack.deploy(
+          Effect.gen(function* () {
+            return yield* Cloudflare.R2.Bucket("LockedBucket", { lockRules });
+          }),
+        );
+
+      const created = yield* deploy([
+        {
+          id: "audit-retention",
+          condition: { type: "Age", maxAgeSeconds: 2_592_000 },
+        },
+      ]);
+      expect(created.bucketName).toMatch(/^dev:/);
+      expect(created.lockRules).toEqual([
+        {
+          id: "audit-retention",
+          enabled: true,
+          prefix: "",
+          condition: { type: "Age", maxAgeSeconds: 2_592_000 },
+        },
+      ]);
+
+      const retained = yield* deploy();
+      expect(retained.lockRules).toEqual(created.lockRules);
+
+      const cleared = yield* deploy([]);
+      expect(cleared.lockRules).toEqual([]);
+      yield* stack.destroy();
+    }).pipe(logLevel),
+  { timeout: 120_000 },
+);
+
 /**
  * The `*Local` R2 capability layers reach the local simulator through an
  * ephemeral workerd gateway that emulates the R2 REST API over the native

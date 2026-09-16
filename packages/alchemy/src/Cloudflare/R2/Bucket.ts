@@ -134,7 +134,31 @@ export type BucketCorsRule = {
   maxAgeSeconds?: number;
 };
 
+/** Retention rule that prevents matching objects from being overwritten or deleted. */
+export interface BucketLockRule {
+  /** Unique rule identifier. */
+  id: string;
+  /** Whether the rule is active. @default true */
+  enabled?: boolean;
+  /** Object key prefix; an empty prefix matches every object. @default "" */
+  prefix?: string;
+  /** Keep objects for an age in seconds, until a date, or indefinitely. */
+  condition:
+    | { type: "Age"; maxAgeSeconds: number }
+    | { type: "Date"; date: string }
+    | { type: "Indefinite" };
+}
+
+const normalizeLockRule = (rule: BucketLockRule): Required<BucketLockRule> => ({
+  id: rule.id,
+  enabled: rule.enabled ?? true,
+  prefix: rule.prefix ?? "",
+  condition: rule.condition,
+});
+
 export type BucketProps = {
+  /** Object retention locks. Omit to preserve existing rules; use [] to clear them. */
+  lockRules?: BucketLockRule[];
   /**
    * Name of the bucket. If omitted, a unique name will be generated.
    * @default ${app}-${stage}-${id}
@@ -215,6 +239,8 @@ export type Bucket = Resource<
     domains: Bucket.CustomDomain[];
     lifecycleRules: Bucket.LifecycleRule[];
     cors: Bucket.CorsRule[];
+    /** Managed object retention locks, if this resource has configured them. */
+    lockRules?: BucketLockRule[];
     /**
      * Hostname of the bucket's Cloudflare-managed `r2.dev` domain.
      * Set only while `publicAccess` is enabled; `undefined` when
@@ -1259,6 +1285,34 @@ export const ProviderLive = () =>
             news.cors ?? [],
           );
 
+          let lockRules = output?.lockRules;
+          if (news.lockRules !== undefined || lockRules !== undefined) {
+            const current = yield* r2
+              .getBucketLock({
+                accountId: acct,
+                bucketName: attrs.bucketName,
+                jurisdiction: attrs.jurisdiction,
+              })
+              .pipe(
+                Effect.retry({
+                  while: (error) => error._tag === "NoSuchBucket",
+                  schedule: r2BucketEndpointConsistencySchedule,
+                }),
+              );
+            const observedRules = (current.rules ?? []).map((rule) =>
+              normalizeLockRule({ ...rule, prefix: rule.prefix ?? undefined }),
+            );
+            lockRules = news.lockRules?.map(normalizeLockRule) ?? observedRules;
+            if (!deepEqual(observedRules, lockRules)) {
+              yield* r2.putBucketLock({
+                accountId: acct,
+                bucketName: attrs.bucketName,
+                jurisdiction: attrs.jurisdiction,
+                rules: lockRules.map(normalizeLockRule),
+              });
+            }
+          }
+
           const publicDomain = yield* reconcileManagedDomain(
             attrs.bucketName,
             attrs.jurisdiction,
@@ -1270,6 +1324,7 @@ export const ProviderLive = () =>
             domains,
             lifecycleRules,
             cors,
+            lockRules,
             publicDomain,
           };
         }),
@@ -1340,6 +1395,7 @@ export const ProviderLive = () =>
                 domains: output?.domains ?? [],
                 lifecycleRules: output?.lifecycleRules ?? [],
                 cors: output?.cors ?? [],
+                lockRules: output?.lockRules,
                 publicDomain: output?.publicDomain,
               })),
               Effect.catchTag("NoSuchBucket", () => Effect.succeed(undefined)),
@@ -1388,6 +1444,7 @@ export const ProviderLocal = () =>
         domains: [],
         lifecycleRules: [],
         cors: [],
+        lockRules: news.lockRules?.map(normalizeLockRule) ?? output?.lockRules,
         publicDomain: undefined,
       };
     }),
